@@ -1,0 +1,372 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Watchdog0x/jabridge/daemon/ipc"
+	firmwaretool "github.com/Watchdog0x/jabridge/internal/firmware"
+	"github.com/Watchdog0x/jabridge/internal/headsetvolume"
+	"github.com/Watchdog0x/jabridge/internal/modelcatalog"
+)
+
+var deviceDiagnosticMu sync.Mutex
+
+func (j *jabraAPIBridge) DiagnoseDevice(id uint16) ([]ipc.DiagnosticCheck, error) {
+	if !deviceDiagnosticMu.TryLock() {
+		return nil, fmt.Errorf("another device diagnostic is already running")
+	}
+	defer deviceDiagnosticMu.Unlock()
+	device := deviceForID(id)
+	if device == nil {
+		return nil, fmt.Errorf("device disconnected before diagnostic")
+	}
+	refreshControlParts(device)
+	if current := deviceForID(id); current != nil {
+		device = current
+	}
+	checks := []ipc.DiagnosticCheck{}
+	add := func(feature, state, detail string) {
+		checks = append(checks, ipc.DiagnosticCheck{Feature: feature, State: state, Detail: detail})
+	}
+	checks = append(checks, controlPartDiagnostics(device)...)
+	management := device
+	if device.deviceConnection == deviceConnectionType_BT {
+		management = deviceForID(device.parentDeviceID)
+	}
+	if management != nil && !management.gnpDestinationKnown {
+		// Retry the existing IDENT reads after permissions may have changed.
+		// Keep ownership in the daemon and use only supported descriptors.
+		enrichUSBDevice(management)
+		management = deviceForID(management.deviceID)
+		if current := deviceForID(id); current != nil {
+			device = current
+		}
+	}
+	ready := management != nil && management.gnpDestinationKnown
+	if !ready {
+		add("native control", "BLOCKED", "No responsive management endpoint. Check HID access/report diagnostics; not proof of unsupported hardware.")
+		if management != nil && management.controlDiagnostic != "" {
+			add("IDENT discovery attempts", "INFO", management.controlDiagnostic)
+		}
+	} else {
+		address := device.gnpDestination
+		if device.deviceConnection == deviceConnectionType_BT {
+			address = 4
+		}
+		role := firmwaretool.DECTComponentRole(device.productID, address)
+		roleNote := ""
+		if role != "" {
+			roleNote = " (" + role + " on this model)"
+			if role != "base" {
+				roleNote = " (" + role + " on this model; the base is address 1)"
+			}
+		}
+		add("native control", "INFO", fmt.Sprintf("daemon endpoint=%s address=%d%s; individual reads tested below", filepath.Base(management.hidrawPath), address, roleNote))
+		if version, err := readFirmwareVersion(device); err == nil {
+			if safeFirmwareDiagnostic(version) == "version format unrecognized" {
+				add("native installed firmware", "FAIL", "response version format unrecognized")
+			} else {
+				device.firmwareVersion = version
+				updateDeviceSnapshot(device, func(current *jabra_DeviceInfo) {
+					current.firmwareVersion = version
+				})
+				detail := safeFirmwareDiagnostic(version)
+				if role != "" {
+					detail += fmt.Sprintf(" (configured endpoint: %s, address %d; this read may use a fallback address)", role, address)
+				}
+				add("native installed firmware", "PASS", detail)
+			}
+		} else {
+			add("native installed firmware", "FAIL", protocolDiagnosticError(err))
+		}
+		if !device.isDongle {
+			if battery, err := readGNPBatteryStatus(device); err == nil {
+				add("native battery", "PASS", fmt.Sprintf("%d%%; charging=%t; extra batteries=%d", battery.levelInPercent, battery.charging, len(battery.components)))
+			} else {
+				detail := protocolDiagnosticError(err)
+				state := "UNAVAILABLE"
+				if detail == "response format/value rejected by native decoder" {
+					state = "FAIL"
+				}
+				add("native battery", state, detail+"; wired devices may have no battery")
+			}
+		}
+	}
+	capabilities, catalogErr := lookupDeviceModel(device)
+	if catalogErr != nil {
+		var ambiguity *modelcatalog.AmbiguousVariantError
+		if errors.As(catalogErr, &ambiguity) {
+			variants := strings.Join(ambiguity.Variants, ", ")
+			if variants == "" {
+				variants = "variant labels unavailable"
+			}
+			add("online model catalog", "INFO", fmt.Sprintf("USB PID matches %d published variants (%s); device variant is required before selecting settings.", ambiguity.Count, variants))
+		} else {
+			add("online model catalog", "UNAVAILABLE", "Model/variant lookup failed; model-filtered settings coverage cannot be established.")
+		}
+	} else {
+		add("online model catalog", "INFO", fmt.Sprintf("profile=%s; properties=%d; exact installed version=%t (metadata, not a hardware test)", safeFirmwareDiagnostic(capabilities.Firmware), len(capabilities.Properties), capabilities.DeviceFirmware != "" && capabilities.ExactFirmwareProfile))
+		if capabilities.FirmwareProtocolKnown {
+			add("firmware update protocol", "INFO", fmt.Sprintf("catalog protocol %d; transfer/recovery not tested", capabilities.FirmwareProtocol))
+		}
+	}
+	checks = append(checks, diagnoseSettings(device, capabilities, ready)...)
+	if headsetvolume.KnownModel(device.productID) && device.deviceConnection == deviceConnectionType_USB {
+		if !headsetvolume.Supported(device.productID, device.firmwareVersion) {
+			add("headset volume", "UNAVAILABLE", "This direct volume path requires firmware 1.11.0.")
+		} else if info, err := device.volumeAttachment.Descriptor(); err != nil {
+			add("headset volume descriptors", "BLOCKED", protocolDiagnosticError(err))
+		} else {
+			add("headset volume descriptors", "INFO", fmt.Sprintf("USB Audio 1; interface=%d; playback path=1->8->2->3; channels=%d; advertised-volume=%t. Cached descriptors only; no volume request sent.", info.Interface, info.Channels, info.AdvertisedVolume))
+		}
+	}
+	checks = append(checks, diagnosticClosingChecks(device)...)
+	return checks, nil
+}
+
+func protocolDiagnosticError(err error) string {
+	if err == nil {
+		return "ready"
+	}
+	var descriptorErr *headsetvolume.DescriptorError
+	if errors.As(err, &descriptorErr) {
+		return descriptorErr.Error()
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "timeout"), strings.Contains(message, "timed out"):
+		return "device reply timed out"
+	case strings.Contains(message, "nak"):
+		return "device rejected query"
+	case strings.Contains(message, "invalid"), strings.Contains(message, "returned"), strings.Contains(message, "too short"):
+		return "response format/value rejected by native decoder"
+	default:
+		return diagnosticError(err)
+	}
+}
+
+func safeFirmwareDiagnostic(value string) string {
+	if len(value) == 0 || len(value) > 40 {
+		return "version format unrecognized"
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && char != '.' && char != '-' {
+			return "version format unrecognized"
+		}
+	}
+	return value
+}
+
+func diagnoseSettings(device *jabra_DeviceInfo, capabilities *modelcatalog.Capabilities, ready bool) []ipc.DiagnosticCheck {
+	checks := []ipc.DiagnosticCheck{}
+	if capabilities == nil && !ready && !device.isDongle {
+		return []ipc.DiagnosticCheck{{
+			Feature: "setting discovery",
+			State:   "BLOCKED",
+			Detail:  "Management transport and exact model variant are unavailable; individual settings were not probed.",
+		}}
+	}
+	covered := map[string]bool{}
+	seen := map[string]bool{}
+	failures := map[string]int{}
+	deadline := time.Now().Add(30 * time.Second)
+	run := func(key string, override byte, properties []string, probe bool, read func() (string, error)) {
+		if seen[key] {
+			return
+		}
+		_, supported := firstCatalogProperty(capabilities, properties)
+		if capabilities != nil && !device.isDongle && !supported {
+			return
+		}
+		if capabilities == nil && !device.isDongle && !probe {
+			return
+		}
+		seen[key] = true
+		for _, property := range properties {
+			covered[property] = true
+		}
+		check := ipc.DiagnosticCheck{Feature: "setting " + key}
+		role := settingPartRole(device, key, override)
+		partReady := ready
+		if role != "" {
+			_, partReady = findControlPart(device, role)
+		}
+		switch {
+		case !partReady:
+			check.State = "BLOCKED"
+			check.Detail = "Management endpoint unavailable."
+		case failures[role] >= 3 || time.Now().After(deadline):
+			check.State = "NOT TESTED"
+			check.Detail = "Stopped after repeated read failures or the read-time budget."
+		default:
+			value, err := read()
+			if err != nil {
+				failures[role]++
+				check.State = "FAIL"
+				check.Detail = protocolDiagnosticError(err)
+			} else {
+				check.State = "PASS"
+				check.Detail = value + " (current device read; no write sent by this report)"
+			}
+		}
+		checks = append(checks, check)
+	}
+	scope := settingScopeHeadset
+	if device.isDongle {
+		scope = settingScopeDongle
+	}
+	for _, definition := range settingDefinitions(scope) {
+		run(definition.Key, definition.Destination, definition.CatalogProperties, definition.ProbeWithoutCatalog, func() (string, error) { value, err := readBoolSetting(device, definition); return onOff(value), err })
+		annotateSettingQuery(checks, definition.Key, device, definition.Destination, definition.Class, definition.Op)
+	}
+	for _, definition := range choiceSettingDefinitions(scope) {
+		if definition.DongleExactProfile {
+			if !matchingDongleSettingModel(device, capabilities) {
+				continue
+			}
+			if _, supported := firstCatalogProperty(capabilities, definition.CatalogProperties); !supported {
+				continue
+			}
+		}
+		run(definition.Key, definition.Destination, definition.CatalogProperties, definition.ProbeWithoutCatalog, func() (string, error) {
+			if property, ok := firstCatalogProperty(capabilities, definition.CatalogProperties); ok {
+				if definition.Codec != nil || definition.DongleExactProfile {
+					var supported bool
+					definition, supported = choiceSettingForCatalog(definition, property, exactSettingProfile(capabilities))
+					if !supported {
+						return "", errors.New("model setting profile is incomplete")
+					}
+				} else {
+					definition.Choices = choicesAllowedByCatalog(definition.Choices, property.PossibleValues)
+				}
+			}
+			definition, _ = constrainNoiseCycle(device, capabilities, definition)
+			definition = presentVoiceGuidance(device, definition)
+			definition = applyChoiceWritePolicy(definition)
+			value, err := readChoiceSetting(device, definition)
+			if err == nil && value.ChoiceIndex < 0 && value.FallbackName == "" {
+				return "", fmt.Errorf("invalid choice value")
+			}
+			name := choiceSettingName(value)
+			if definition.Help != "" {
+				name += "; " + definition.Help
+			}
+			return name, err
+		})
+		annotateSettingQuery(checks, definition.Key, device, definition.Destination, definition.Class, definition.Op)
+	}
+	if !device.isDongle {
+		run("voice-language", 0, []string{"currentVoiceLanguage"}, false, func() (string, error) { value, err := readVoiceLanguageSetting(device); return value.valueName(), err })
+		annotateSettingQuery(checks, "voice-language", device, 0, gnpClassConfig, 0x74)
+		for _, definition := range headsetTextSettingDefinitions {
+			run(definition.Key, definition.Destination, definition.CatalogProperties, false, func() (string, error) {
+				_, err := readTextSetting(device, definition)
+				return "text read; value omitted for privacy", err
+			})
+			annotateSettingQuery(checks, definition.Key, device, definition.Destination, definition.Class, definition.Op)
+		}
+	}
+	checks = append(checks, catalogCoverageChecks(capabilities, covered)...)
+	return checks
+}
+
+func annotateSettingQuery(checks []ipc.DiagnosticCheck, key string, device *jabra_DeviceInfo, override, class, op byte) {
+	if len(checks) == 0 || checks[len(checks)-1].Feature != "setting "+key {
+		return
+	}
+	check := &checks[len(checks)-1]
+	if strings.Contains(check.Detail, "query=") {
+		return
+	}
+	address := gnpSrcHost
+	if device.isDongle {
+		address = gnpSrcDongle
+	} else if device.deviceConnection == deviceConnectionType_BT {
+		address = 4
+	} else if device.gnpDestinationKnown {
+		address = device.gnpDestination
+	}
+	address = settingDestination(override, address)
+	if role := settingPartRole(device, key, override); role != "" {
+		part, ok := findControlPart(device, role)
+		if ok {
+			address = part.Address
+		}
+		check.Detail += "; part=" + role
+	}
+	check.Detail += fmt.Sprintf("; query=%02x/%02x address=%d", class, op, address)
+}
+
+func catalogCoverageChecks(capabilities *modelcatalog.Capabilities, covered map[string]bool) []ipc.DiagnosticCheck {
+	if capabilities == nil {
+		return nil
+	}
+	var keys []string
+	for key := range capabilities.Properties {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var checks []ipc.DiagnosticCheck
+	for _, key := range keys {
+		state := "NOT COVERED"
+		if covered[key] {
+			state = "INFO"
+		}
+		checks = append(checks, ipc.DiagnosticCheck{Feature: "catalog property " + key, State: state, Detail: catalogPropertyDetail(capabilities.Properties[key])})
+	}
+	return checks
+}
+
+func catalogPropertyDetail(property modelcatalog.Property) string {
+	access := property.Access
+	if access == "" {
+		access = "unknown"
+	}
+	restart := "unknown"
+	if property.RestartKnown {
+		restart = fmt.Sprint(property.RequiresRestart)
+	}
+	detail := fmt.Sprintf("id=%s; type=%s; choices=%v; access=%s; restart=%s", property.SettingID, property.Kind, property.PossibleValues, access, restart)
+	if property.Group != "" {
+		detail += "; group=" + property.Group
+	}
+	if property.Help != "" {
+		detail += "; help=" + property.Help
+	}
+	return detail + "; metadata only, runtime protection not tested"
+}
+
+// This reports service policy, without probing device capabilities or health.
+func pairingAccessCheck(device *jabra_DeviceInfo) (ipc.DiagnosticCheck, bool) {
+	if device == nil || !device.isDongle {
+		return ipc.DiagnosticCheck{}, false
+	}
+	policy := pairingPolicyFor(device)
+	detail := "Pairing is not enabled for this USB ID. Policy check only; no device query sent."
+	switch {
+	case device.productID == 0x2e56 && !policy.Reads && !policy.SearchConnect:
+		detail = "Pairing list, Find headset and connect are off for USB ID 2e56 by release policy until this ID is confirmed on hardware. This is not a dongle, access or service fault, and no opt-in exists. Policy check only; no device query sent."
+	case device.productID == 0x24c9:
+		detail = "Pairing list, search and fresh pairing are enabled for this USB ID after a reported successful pairing. Remembered-device changes stay off. Policy check only; no device query sent."
+	case policy.Reads && policy.SearchConnect:
+		detail = "Pairing list, Find headset and connect are enabled for this USB ID. Policy check only; no device query sent."
+	}
+	return ipc.DiagnosticCheck{Feature: "pairing access", State: "INFO", Detail: detail}, true
+}
+
+func diagnosticClosingChecks(device *jabra_DeviceInfo) []ipc.DiagnosticCheck {
+	var checks []ipc.DiagnosticCheck
+	if pairing, ok := pairingAccessCheck(device); ok {
+		checks = append(checks, pairing)
+	}
+	for _, feature := range []string{"setting writes and read-back", "pairing/reset", "firmware installation/recovery", "microphone and speaker audio quality", "button/wheel behavior", "meeting-app call control", "USB reconnect and power cycle"} {
+		checks = append(checks, ipc.DiagnosticCheck{Feature: feature, State: "NOT TESTED", Detail: "Needs a separate hardware test; not exercised by this read-only report."})
+	}
+	return checks
+}

@@ -1,0 +1,113 @@
+package firmware
+
+import (
+	"fmt"
+)
+
+// ValidateInstallInput performs file-only checks before the CLI interrupts a
+// running service. Device matching, release authenticity and confirmation are
+// still checked by the installer; this function never authorizes a write.
+func ValidateInstallInput(args []string) error {
+	remaining, language, err := extractCSRLanguageOption(args)
+	if err != nil {
+		return err
+	}
+	args = remaining
+	args, previewOptions, err := extractEngage75Options(args)
+	preview := previewOptions.preview
+	if err != nil {
+		return err
+	}
+	if preview && language != 0 {
+		return fmt.Errorf("engage 75 preview requires the complete firmware package")
+	}
+	path, _, err := parseInstallArgs(args)
+	if err != nil {
+		return err
+	}
+	snapshot, err := freezeFirmwareFile(path)
+	if err != nil {
+		return fmt.Errorf("firmware file: %w", err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	path = snapshot.path
+	if preview {
+		previous, err := loadEngage75PreviewStart(previewOptions.newAttempt)
+		if err != nil {
+			return err
+		}
+		if previous != nil && previous.ArchiveSHA256 != snapshot.digest {
+			return fmt.Errorf("the new attempt needs the exact original firmware archive")
+		}
+		archive, err := loadSitelDECTArchive(path)
+		if err != nil {
+			return err
+		}
+		if archive.Engage75 == nil || archive.Manifest.ProductName != "Jabra_Engage_75" || archive.Manifest.Version != "5.20.1" {
+			return fmt.Errorf("engage 75 preview requires its complete original 5.20.1 archive")
+		}
+		return nil
+	}
+	if language != 0 {
+		if err := checkCSRLanguageOptIn(); err != nil {
+			return err
+		}
+		manifest, contents, err := parseGnVArchive(path)
+		if err != nil {
+			return err
+		}
+		_, err = prepareCSRLanguagePlan(manifest, contents, 17, language)
+		return err
+	}
+	format, err := detectFormat(path)
+	if err != nil {
+		return err
+	}
+	if format == FormatCSRDFU2 {
+		_, err := loadJabraDFUImage(path)
+		return err
+	}
+	if format != FormatGnVArchive {
+		return fmt.Errorf("unsupported firmware file format: %s", format.String())
+	}
+	manifest, err := parseFirmwareManifest(path)
+	if err != nil {
+		return err
+	}
+	if isBulkCameraManifest(manifest) {
+		_, err := loadBulkCameraArchive(path)
+		return err
+	}
+	if isUVCCameraManifest(manifest) {
+		_, err := loadUVCCameraArchive(path)
+		return err
+	}
+	if isPanaCast50Manifest(manifest) {
+		_, err := loadPanaCast50Archive(path)
+		return err
+	}
+	if isSitelOTAManifest(manifest) {
+		_, err := loadSitelOTAArchive(path)
+		return err
+	}
+	if isSitelDECTManifest(manifest) {
+		_, err := loadSitelDECTArchive(path)
+		return err
+	}
+	if isConexantManifest(manifest) {
+		_, err := loadConexantImage(path)
+		return err
+	}
+	if isUSBDFUManifest(manifest) {
+		_, err := loadJabraDFUImage(path)
+		return err
+	}
+	if isSitelManifest(manifest) {
+		_, _, err := loadSitelImages(path)
+		return err
+	}
+	if isExtendedCSRManifest(manifest) {
+		return validateExtendedCSRArchive(path)
+	}
+	return validateNativeCSRArchive(path)
+}

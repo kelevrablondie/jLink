@@ -1,0 +1,745 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/Watchdog0x/jabridge/internal/modelcatalog"
+)
+
+type settingChoice struct {
+	Name         string
+	Raw          byte
+	CatalogValue string
+}
+
+type choiceSettingDefinition struct {
+	Key                 string
+	Label               string
+	Help                string
+	Scope               settingScope
+	Class               byte
+	Op                  byte
+	Destination         byte
+	Request             []byte
+	ResponseIndex       int
+	WritePrefix         []byte
+	Choices             []settingChoice
+	CatalogProperties   []string
+	Writable            bool
+	NeedsConfigMode     bool
+	BitMask             byte
+	PreservePayload     bool
+	ProbeWithoutCatalog bool
+	Codec               choicePayloadCodec
+	ExpectedFirmware    string
+	ResponseBytes       int
+	DongleExactProfile  bool
+	Link390Config       bool
+	ResponsePrefix      []byte
+}
+
+type choiceSettingValue struct {
+	Catalog      settingCatalogMetadata
+	Provenance   settingProvenance
+	Definition   choiceSettingDefinition
+	ChoiceIndex  int
+	Raw          byte
+	Editable     bool
+	Payload      string
+	FallbackName string
+}
+
+var commonButtonFunctions = []settingChoice{
+	{Name: "None", Raw: 0, CatalogValue: "noFunction"},
+	{Name: "Call handling", Raw: 1, CatalogValue: "callHandling"},
+	{Name: "Mute", Raw: 2, CatalogValue: "mute"},
+	{Name: "Speed dial", Raw: 3, CatalogValue: "speedDial"},
+	{Name: "Busylight", Raw: 4, CatalogValue: "busylight"},
+	{Name: "Push to talk", Raw: 5, CatalogValue: "pushToTalk"},
+	{Name: "Headset busylight", Raw: 6, CatalogValue: "busylightHeadset"},
+	{Name: "Microsoft Teams", Raw: 7, CatalogValue: "msTeam"},
+	{Name: "Music", Raw: 8, CatalogValue: "music"},
+}
+
+var headsetChoiceSettingDefinitions = []choiceSettingDefinition{
+	{
+		Key: "noise-cycle", Label: "Noise control button cycle", Scope: settingScopeHeadset,
+		Help:  "Choose which modes the noise control button cycles through.",
+		Class: gnpClassConfig, Op: 0xbf, Writable: true,
+		CatalogProperties: []string{"ancSoundModeLoop"}, Codec: noiseCycleCodec{},
+	},
+	{
+		Key: "call-button", Label: "Call button action", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x27, Request: []byte{0, 0}, WritePrefix: []byte{0, 0}, ResponseIndex: 2,
+		CatalogProperties: []string{"button1Tap"}, Writable: true,
+		Choices: []settingChoice{
+			{Name: "None", Raw: 0, CatalogValue: "noFunction"}, {Name: "Call handling", Raw: 1, CatalogValue: "answerOrEndCall"},
+			{Name: "Mute", Raw: 2, CatalogValue: "muteMicrophone"}, {Name: "Speed dial", Raw: 12, CatalogValue: "speedDial"},
+			{Name: "Push to talk", Raw: 16, CatalogValue: "pushToTalk"}, {Name: "Busylight", Raw: 17, CatalogValue: "toggleBusyState"},
+			{Name: "Cortana", Raw: 19, CatalogValue: "cortana"}, {Name: "Music", Raw: 20, CatalogValue: "playOrPause"},
+		},
+	},
+	{
+		Key: "noise-control", Label: "Noise control", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0xbe, Request: []byte{1}, WritePrefix: []byte{1}, Writable: true,
+		CatalogProperties: []string{"ancAmbienceMode"}, Choices: []settingChoice{
+			{Name: "Off", Raw: 1, CatalogValue: "off"}, {Name: "HearThrough", Raw: 2, CatalogValue: "hearThrough"}, {Name: "ANC", Raw: 4, CatalogValue: "anc"},
+		},
+	},
+	{
+		// Evolve2 85 (catalog ancMode): the ANC button cycles 13/87 through
+		// 03 (HearThrough), 01 (ANC) and 00 (off). hearThroughMix is listed by
+		// the catalog but its raw value is not confirmed, so it is not offered.
+		Key: "noise-control", Label: "Noise control", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x87, Writable: true,
+		CatalogProperties: []string{"ancMode"}, Choices: []settingChoice{
+			{Name: "Off", Raw: 0, CatalogValue: "off"}, {Name: "HearThrough", Raw: 3, CatalogValue: "hearThrough"}, {Name: "ANC", Raw: 1, CatalogValue: "anc"},
+		},
+	},
+	{
+		Key: "hearthrough-level", Label: "HearThrough level", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0xbe, Request: []byte{2}, WritePrefix: []byte{2}, Writable: true,
+		CatalogProperties: []string{"ancHearThroughLevel"}, Choices: []settingChoice{
+			{Name: "Level 1", Raw: 0, CatalogValue: "0"}, {Name: "Level 2", Raw: 1, CatalogValue: "1"}, {Name: "Level 3", Raw: 2, CatalogValue: "2"},
+		},
+	},
+	{
+		Key: "sidetone-level", Label: "Sidetone level", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x68, Choices: sidetoneLevelChoices(),
+		CatalogProperties: []string{"sidetoneLevelEnum"}, Writable: true, ProbeWithoutCatalog: true,
+	},
+	{
+		Key: "sidetone-level", Label: "Sidetone level", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x7c, ResponseIndex: 1, Choices: sidetoneLevelChoices(),
+		CatalogProperties: []string{"sidetoneLevelDsp"}, Writable: true, PreservePayload: true,
+	},
+	{
+		Key: "voice-prompts", Label: "Voice prompts", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x3a, Choices: []settingChoice{
+			{Name: "Tones", Raw: 0, CatalogValue: "tones"},
+			{Name: "Voice", Raw: 1, CatalogValue: "voice"},
+			{Name: "Off", Raw: 2, CatalogValue: "off"},
+		}, CatalogProperties: []string{"voicePrompts"}, Writable: true, ProbeWithoutCatalog: true,
+	},
+	{
+		Key: "controller-ringer-volume", Label: "Controller ringer volume", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x03, Destination: 3, Request: []byte{0}, ResponseIndex: 1,
+		WritePrefix: []byte{0}, Choices: []settingChoice{
+			{Name: "Off", Raw: 0, CatalogValue: "0"},
+			{Name: "Low", Raw: 1, CatalogValue: "1"},
+			{Name: "Medium", Raw: 2, CatalogValue: "2"},
+			{Name: "High", Raw: 3, CatalogValue: "3"},
+		}, CatalogProperties: []string{"controllerRingerVolume"}, Writable: true, ProbeWithoutCatalog: true,
+	},
+	{
+		Key: "controller-ringtone", Label: "Controller ringtone", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x3d, Destination: 3, Request: []byte{0}, ResponseIndex: 1,
+		WritePrefix: []byte{0}, Choices: ringtoneChoices(), CatalogProperties: []string{"controllerRingtone"}, Writable: true,
+	},
+	{
+		Key: "boom-arm-action", Label: "Boom arm mute/action", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x98, Choices: []settingChoice{
+			{Name: "Disabled", Raw: 0, CatalogValue: "disabled"},
+			{Name: "Mute", Raw: 1, CatalogValue: "mute"},
+			{Name: "End call", Raw: 4, CatalogValue: "endCall"},
+			{Name: "Full mute", Raw: 8, CatalogValue: "fullMute"},
+		}, CatalogProperties: []string{"boomArmRotateInCallAction"}, Writable: true,
+		BitMask: 0x0d, PreservePayload: true,
+	},
+	{
+		Key: "boom-arm-guidance", Label: "Boom arm guidance", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0xbc, Choices: []settingChoice{
+			{Name: "Sound effects", Raw: 0, CatalogValue: "soundEffects"},
+			{Name: "Voice prompts", Raw: 1, CatalogValue: "prompts"},
+			{Name: "Off", Raw: 2, CatalogValue: "off"},
+		}, CatalogProperties: []string{"callAcceptedSound"}, Writable: true,
+	},
+	{
+		Key: "audio-protection", Label: "Audio protection", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x01, Choices: []settingChoice{
+			{Name: "Basic PeakStop", Raw: 0, CatalogValue: "peakStopOnly"},
+			{Name: "Level 1", Raw: 1, CatalogValue: "level1"},
+			{Name: "Level 2", Raw: 2, CatalogValue: "level2"},
+			{Name: "Level 3", Raw: 3, CatalogValue: "level3"},
+			{Name: "Level 4", Raw: 4, CatalogValue: "level4"},
+			{Name: "G616", Raw: 5, CatalogValue: "g616"},
+		}, CatalogProperties: []string{"intellitoneLevel"}, Writable: true,
+	},
+	{
+		Key: "intellitone-level", Label: "IntelliTone level", Scope: settingScopeHeadset,
+		Help:  "Applies when IntelliTone audio protection is enabled.",
+		Class: gnpClassConfig, Op: 0x26, Writable: true,
+		CatalogProperties: []string{"intellitoneSoundLevel"}, Choices: []settingChoice{
+			{Name: "79 dB", Raw: 79, CatalogValue: "level79"},
+			{Name: "82 dB", Raw: 82, CatalogValue: "level82"},
+			{Name: "85 dB", Raw: 85, CatalogValue: "level85"},
+			{Name: "88 dB", Raw: 88, CatalogValue: "level88"},
+			{Name: "91 dB", Raw: 91, CatalogValue: "level91"},
+		},
+	},
+	{
+		Key: "auto-sleep", Label: "Auto sleep", Scope: settingScopeHeadset,
+		// Jabra Plus labels AUTO_SLEEP sleep1..sleep7 as 15 min through
+		// 8 hours (#56). Keep the catalog and wire values unchanged.
+		Class: gnpClassConfig, Op: 0x90, Choices: []settingChoice{
+			{Name: "Never", Raw: 0, CatalogValue: "0"},
+			{Name: "15 min", Raw: 3, CatalogValue: "3"},
+			{Name: "30 min", Raw: 6, CatalogValue: "6"},
+			{Name: "1 hour", Raw: 12, CatalogValue: "12"},
+			{Name: "2 hours", Raw: 24, CatalogValue: "24"},
+			{Name: "4 hours", Raw: 48, CatalogValue: "48"},
+			{Name: "6 hours", Raw: 72, CatalogValue: "72"},
+			{Name: "8 hours", Raw: 96, CatalogValue: "96"},
+		}, CatalogProperties: []string{"inactivityDelay"}, Writable: true,
+	},
+	{
+		Key: "mute-reminder", Label: "Mute reminder", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x1e, Choices: muteReminderChoices(),
+		CatalogProperties: []string{"muteReminderInterval"}, Writable: true,
+	},
+	{
+		Key: "sound-mode", Label: "Sound mode", Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x15, Choices: []settingChoice{
+			{Name: "Normal", Raw: 0, CatalogValue: "normal"},
+			{Name: "Bass", Raw: 1, CatalogValue: "bass"},
+			{Name: "Treble", Raw: 2, CatalogValue: "treble"},
+		}, CatalogProperties: []string{"soundMode"}, Writable: true,
+	},
+	buttonFunctionDefinition("call-button", "Call button", "buttonFunctionMfb", 0),
+	buttonFunctionDefinition("mute-button", "Mute button", "buttonFunctionMute", 8),
+	buttonFunctionDefinition("three-dot-button", "Three-dot button", "buttonFunction3Dots", 18),
+	buttonFunctionDefinition("four-dot-button", "Four-dot button", "buttonFunction4Dots", 19),
+}
+
+func buttonFunctionDefinition(key, label, catalogProperty string, buttonID byte) choiceSettingDefinition {
+	return choiceSettingDefinition{
+		Key: key, Label: label, Scope: settingScopeHeadset,
+		Class: gnpClassConfig, Op: 0x8a, Request: []byte{buttonID}, ResponseIndex: 1,
+		WritePrefix: []byte{buttonID}, Choices: append([]settingChoice(nil), commonButtonFunctions...),
+		CatalogProperties: []string{catalogProperty}, Writable: true, NeedsConfigMode: true, ProbeWithoutCatalog: true,
+	}
+}
+
+func muteReminderChoices() []settingChoice {
+	choices := []settingChoice{{Name: "Off", Raw: 0, CatalogValue: "0"}}
+	for seconds := 10; seconds <= 60; seconds += 10 {
+		choices = append(choices, settingChoice{
+			Name: fmt.Sprintf("%d seconds", seconds), Raw: byte(seconds), CatalogValue: fmt.Sprintf("%d", seconds),
+		})
+	}
+	return choices
+}
+
+func sidetoneLevelChoices() []settingChoice {
+	levels := []struct {
+		value   int
+		catalog string
+	}{
+		{-9, "minus9dB"}, {-6, "minus6dB"}, {-4, "minus4dB"}, {-3, "minus3dB"}, {-2, "minus2dB"},
+		{0, "_0dB"}, {2, "plus2dB"}, {3, "plus3dB"}, {4, "plus4dB"}, {6, "plus6dB"},
+	}
+	choices := make([]settingChoice, 0, len(levels))
+	for _, level := range levels {
+		choices = append(choices, settingChoice{
+			Name: fmt.Sprintf("%d dB", level.value), Raw: byte(int8(level.value)), CatalogValue: level.catalog,
+		})
+	}
+	return choices
+}
+
+func signedRangeChoices(minimum, maximum int, suffix string) []settingChoice {
+	choices := make([]settingChoice, 0, maximum-minimum+1)
+	for value := minimum; value <= maximum; value++ {
+		choices = append(choices, settingChoice{Name: fmt.Sprintf("%d%s", value, suffix), Raw: byte(int8(value))})
+	}
+	return choices
+}
+
+func ringtoneChoices() []settingChoice {
+	choices := make([]settingChoice, 0, 13)
+	for index := 0; index < 10; index++ {
+		choices = append(choices, settingChoice{
+			Name: fmt.Sprintf("Tone %d", index+1), Raw: byte(index), CatalogValue: fmt.Sprintf("type%d", index),
+		})
+	}
+	return append(choices,
+		settingChoice{Name: "Custom", Raw: 128, CatalogValue: "custom"},
+		settingChoice{Name: "Random", Raw: 254, CatalogValue: "random"},
+		settingChoice{Name: "Off", Raw: 255, CatalogValue: "off"},
+	)
+}
+
+var dongleChoiceSettingDefinitions = []choiceSettingDefinition{
+	{Key: "wireless-range", Label: "Wireless range", Scope: settingScopeDongle,
+		Help:  "Changing this may restart the dongle. Based on Jabra's model data; not tested on hardware.",
+		Class: gnpClassConfig, Op: 0x0e, Writable: true, NeedsConfigMode: true, Link390Config: true,
+		DongleExactProfile: true, ResponseBytes: 1, CatalogProperties: []string{"radioPower"},
+		Choices: []settingChoice{{Name: "Normal", Raw: 1, CatalogValue: "normal"}, {Name: "Low", Raw: 2, CatalogValue: "low"}, {Name: "Very low", Raw: 3, CatalogValue: "veryLow"}}},
+	{Key: "headset-ringer", Label: "Headset ringer", Scope: settingScopeDongle,
+		Help:  "Based on Jabra's model data for this firmware. Jabridge has not tested this on hardware.",
+		Class: gnpClassConfig, Op: 0x13, Writable: true, DongleExactProfile: true,
+		Request: []byte{0}, WritePrefix: []byte{0}, ResponsePrefix: []byte{0}, ResponseIndex: 1, ResponseBytes: 2,
+		CatalogProperties: []string{"ringer"}, Choices: []settingChoice{{Name: "Off", Raw: 0, CatalogValue: "false"}, {Name: "On", Raw: 1, CatalogValue: "true"}}},
+
+	{
+		Key: "preferred-connection-mode", Label: "Preferred connection mode", Scope: settingScopeDongle,
+		Help:  "Based on Jabra's model data for this firmware. Jabridge has not tested this on hardware.",
+		Class: gnpClassConfig, Op: 0xfb, Writable: true, ResponseBytes: 1, DongleExactProfile: true,
+		CatalogProperties: []string{"leAudioCallProfile"},
+		Choices: []settingChoice{
+			{Name: "Wideband mono", Raw: 1, CatalogValue: "widebandMono"},
+			{Name: "Super wideband mono", Raw: 2, CatalogValue: "superWidebandMono"},
+			{Name: "Super wideband stereo", Raw: 3, CatalogValue: "superWidebandStereo"},
+		},
+	},
+	{
+		Key: "computer-audio", Label: "Computer audio", Scope: settingScopeDongle,
+		Help:  "Based on Jabra's model data for this firmware. Jabridge has not tested this on hardware.",
+		Class: gnpClassPairingDevice, Op: 0x0f, Writable: true, ResponseBytes: 1, DongleExactProfile: true,
+		CatalogProperties: []string{"automaticAudioDetection"},
+		Choices: []settingChoice{
+			{Name: "Disabled", Raw: 0, CatalogValue: "disabled"},
+			{Name: "Enabled", Raw: 1, CatalogValue: "enabled"},
+		},
+	},
+}
+
+func choiceSettingDefinitions(scope settingScope) []choiceSettingDefinition {
+	if scope == settingScopeDongle {
+		return append([]choiceSettingDefinition(nil), dongleChoiceSettingDefinitions...)
+	}
+	if scope == settingScopeHeadset {
+		return append(append([]choiceSettingDefinition(nil), headsetChoiceSettingDefinitions...), equalizerDefinitions()...)
+	}
+	return nil
+}
+
+func readChoiceSetting(device *jabra_DeviceInfo, definition choiceSettingDefinition) (choiceSettingValue, error) {
+	payload, err := readChoiceSettingPayload(device, definition)
+	if err != nil {
+		return choiceSettingValue{}, err
+	}
+	return decodeChoiceSettingPayload(definition, payload)
+}
+
+func decodeChoiceSettingPayload(definition choiceSettingDefinition, payload []byte) (choiceSettingValue, error) {
+	if !bytes.HasPrefix(payload, definition.ResponsePrefix) {
+		return choiceSettingValue{}, errors.New("unexpected setting response selector")
+	}
+
+	if definition.ResponseBytes > 0 && len(payload) != definition.ResponseBytes {
+		return choiceSettingValue{}, errors.New("unexpected setting response size")
+	}
+	if definition.Codec == nil && (definition.ResponseIndex < 0 || definition.ResponseIndex >= len(payload)) {
+		return choiceSettingValue{}, fmt.Errorf("setting %s returned %d bytes", definition.Key, len(payload))
+	}
+	if definition.Op == 0x27 && definition.Class == gnpClassConfig && (len(payload) != 3 || payload[0] != 0 || payload[1] != 0) {
+		return choiceSettingValue{}, fmt.Errorf("invalid button/action reply")
+	}
+	var raw byte
+	var fallback, encoded string
+	if definition.Codec != nil {
+		var err error
+		raw, fallback, err = definition.Codec.Decode(payload)
+		if err != nil {
+			return choiceSettingValue{}, err
+		}
+		encoded = string(payload)
+	} else {
+		raw = payload[definition.ResponseIndex]
+		if definition.BitMask != 0 {
+			raw &= definition.BitMask
+		}
+	}
+	if codec, ok := definition.Codec.(noiseCycleCodec); ok {
+		codec.observed = raw
+		definition.Codec = codec
+		if fallback != "" {
+			choice := noiseCycleChoice(raw)
+			choice.Name = fallback
+			definition.Choices = append(append([]settingChoice(nil), definition.Choices...), choice)
+		}
+	}
+	index := -1
+	for choiceIndex, choice := range definition.Choices {
+		if choice.Raw == raw {
+			index = choiceIndex
+			break
+		}
+	}
+	return choiceSettingValue{
+		Definition:   definition,
+		ChoiceIndex:  index,
+		Raw:          raw,
+		Editable:     definition.Writable,
+		Payload:      encoded,
+		FallbackName: fallback,
+	}, nil
+}
+
+func readChoiceSettingPayload(device *jabra_DeviceInfo, definition choiceSettingDefinition) ([]byte, error) {
+	h, destination, err := settingPartTransport(device, definition.Key, definition.Destination)
+	if err != nil {
+		return nil, err
+	}
+	defer h.close()
+	payload, err := gnpQueryPayloadWithDataTimeout(
+		h, destination, nextSeq(), definition.Class, definition.Op, definition.Request, 900*time.Millisecond,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func writeChoiceSetting(device *jabra_DeviceInfo, setting choiceSettingValue, choiceIndex int) error {
+	if setting.Definition.Link390Config {
+		if !isLink390ConfigChoice(device, setting.Definition) || !setting.Editable || choiceIndex < 0 || choiceIndex >= len(setting.Definition.Choices) {
+			return ErrNotSupported
+		}
+		_, err := applyLink390ConfigFromText(device, deviceSettingValue{Choice: &setting}, setting.Definition.Choices[choiceIndex].Name)
+		return err
+	}
+
+	if !choiceDeviceWriteAllowed(device, setting.Definition) {
+		return fmt.Errorf("changing %s is not enabled on this device: %w", setting.Definition.Key, ErrNotSupported)
+	}
+	if !choiceWriteImplemented(setting.Definition) {
+		return fmt.Errorf("%s: %s: %w", setting.Definition.Key, settingWriteNotImplemented, ErrNotSupported)
+	}
+	definition := setting.Definition
+	profiled := definition.Codec != nil || definition.DongleExactProfile
+	if !setting.Editable || !definition.Writable || choiceIndex < 0 || choiceIndex >= len(definition.Choices) {
+		return fmt.Errorf("setting %s is read-only on this device: %w", definition.Key, ErrNotSupported)
+	}
+	if definition.Codec != nil && definition.Choices[choiceIndex].Raw == setting.Raw {
+		return nil
+	}
+	if codec, ok := definition.Codec.(noiseCycleCodec); ok && codec.selections&(1<<definition.Choices[choiceIndex].Raw) == 0 {
+		return errors.New("not among the combinations confirmed for this headset firmware")
+	}
+	if codec, ok := definition.Codec.(noiseCycleCodec); ok {
+		if err := noiseCycleRouteCurrent(device, codec); err != nil {
+			return err
+		}
+	}
+	if profiled && definition.ExpectedFirmware == "" {
+		return errors.New("device firmware profile is unavailable; reopen Settings")
+	}
+	if definition.Codec != nil || definition.PreservePayload {
+		release, err := beginSettingTransaction()
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
+	payload := append(append([]byte(nil), definition.WritePrefix...), definition.Choices[choiceIndex].Raw)
+	if definition.Codec != nil {
+		current, err := readChoiceSettingPayload(device, definition)
+		if err != nil {
+			return fmt.Errorf("read %s before write: %w", definition.Key, err)
+		}
+		payload, err = encodeStructuredChoice(setting, definition.Choices[choiceIndex].Raw, current)
+		if err != nil {
+			return fmt.Errorf("setting %s: %w", definition.Key, err)
+		}
+	} else if definition.PreservePayload {
+		current, err := readChoiceSettingPayload(device, definition)
+		if err != nil {
+			return fmt.Errorf("read %s before write: %w", definition.Key, err)
+		}
+		raw := definition.Choices[choiceIndex].Raw
+		payload, err = mergeSettingPayload(current, definition.ResponseIndex, definition.BitMask, raw)
+		if err != nil {
+			return fmt.Errorf("setting %s: %w", definition.Key, err)
+		}
+	}
+	op := startSettingWriteEvidence(device, definition.Key)
+	var writeErr error
+	if profiled {
+		if definition.NeedsConfigMode {
+			return errors.New("profiled setting needs an unsupported configuration mode")
+		}
+		if guard := choiceSettingRouteGuard(device, definition); guard != nil {
+			writeErr = writeProfiledChoicePacket(device, definition, op, payload, guard)
+		} else {
+			writeErr = writeProfiledSettingPacket(device, definition.Key, op, definition.Destination, definition.Class, definition.Op, payload, definition.ExpectedFirmware)
+		}
+	} else {
+		writeErr = writeSettingPacket(device, definition.Key, op, definition.Destination, definition.Class, definition.Op, payload, definition.NeedsConfigMode)
+	}
+	if writeErr != nil {
+		return fmt.Errorf("write %s: %w", definition.Key, writeErr)
+	}
+	readBack, err := readChoiceSettingWithRetry(device, definition)
+	if err == nil {
+		err = verifySettingReadbackPart(device, definition.Key, definition.Destination)
+	}
+	if err == nil && definition.Codec != nil {
+		err = definition.Codec.Verify(payload, []byte(readBack.Payload))
+	}
+	if err == nil && profiled {
+		if guard := choiceSettingRouteGuard(device, definition); guard != nil {
+			err = withProfiledSettingTransport(device, definition.Key, definition.Destination, definition.ExpectedFirmware, func(h *hidrawConn, _ byte) error {
+				return verifyChoiceRouteReadback(h, guard)
+			})
+		} else {
+			err = verifyProfiledSettingReadback(device, definition.Key, definition.Destination, definition.ExpectedFirmware)
+		}
+	}
+	if err != nil {
+		recordSettingEvidence(device, definition.Key, op, "setting-readback", err)
+		return fmt.Errorf("verify %s: %w", definition.Key, err)
+	}
+	if readBack.Raw != definition.Choices[choiceIndex].Raw {
+		recordSettingEvidence(device, definition.Key, op, "setting-readback", errors.New("setting readback mismatch"))
+		return fmt.Errorf("verify %s: value did not match", definition.Key)
+	}
+	recordSettingEvidence(device, definition.Key, op, "setting-readback", nil)
+	return nil
+}
+
+func readChoiceSettingWithRetry(device *jabra_DeviceInfo, definition choiceSettingDefinition) (choiceSettingValue, error) {
+	var lastErr error
+	for attempt := 0; attempt < 12; attempt++ {
+		candidate := refreshedSettingsDevice(device)
+		value, err := readChoiceSetting(candidate, definition)
+		if err == nil {
+			return value, nil
+		}
+		lastErr = err
+		if !definition.NeedsConfigMode {
+			break
+		}
+		time.Sleep(time.Second)
+		scanAndAttachDevices()
+	}
+	return choiceSettingValue{}, lastErr
+}
+
+func readSupportedChoiceSettings(device *jabra_DeviceInfo, scope settingScope) []choiceSettingValue {
+	definitions := choiceSettingDefinitions(scope)
+	if len(definitions) == 0 {
+		return nil
+	}
+	if scope == settingScopeDongle && !exactDongleSettingProfile(device) {
+		return nil
+	}
+	capabilities, catalogErr := lookupDeviceModel(device)
+	return readChoiceSettingsSnapshot(device, definitions, capabilities, catalogErr, readChoiceSettingPayload)
+}
+
+func readChoiceSettingsSnapshot(device *jabra_DeviceInfo, definitions []choiceSettingDefinition, capabilities *modelcatalog.Capabilities, catalogErr error, read func(*jabra_DeviceInfo, choiceSettingDefinition) ([]byte, error)) []choiceSettingValue {
+	values := make([]choiceSettingValue, 0, len(definitions))
+	seen := make(map[string]struct{})
+	reads := make(choiceSnapshotReads)
+	for _, definition := range definitions {
+		if definition.DongleExactProfile && !matchingDongleSettingModel(device, capabilities) {
+			continue
+		}
+		profiled := definition.Codec != nil || definition.DongleExactProfile
+		sourceDefinition := definition
+		wanted := definition.Writable
+		if isEqualizerBand(definition.Key) {
+			if _, unavailable := seen["equalizer"]; unavailable {
+				continue
+			}
+		}
+		if _, exists := seen[definition.Key]; exists {
+			continue
+		}
+		qualified := false
+		var metadata settingCatalogMetadata
+		var property modelcatalog.Property
+		if catalogErr == nil {
+			var supported bool
+			property, supported = firstCatalogProperty(capabilities, definition.CatalogProperties)
+			if !supported {
+				continue
+			}
+			bound, supported := choiceSettingForCatalog(definition, property, exactSettingProfile(capabilities))
+			if !supported {
+				if definition.Codec != nil {
+					values = appendUnavailableChoice(values, seen, definition, "Not supported on this firmware")
+				}
+				continue
+			}
+			definition, qualified = constrainNoiseCycle(device, capabilities, bound)
+			definition = presentVoiceGuidance(device, definition)
+			metadata = bindSettingCatalogMetadata(device, definition.Key, definition.Destination, property, capabilities)
+			if !choiceWriteImplemented(sourceDefinition) {
+				metadata.Help = ""
+			}
+		} else if definition.ProbeWithoutCatalog {
+			// A current device-model profile is needed before Jabridge can
+			// promise that every write choice is valid for this exact model.
+			// Keep successful reads visible, but do not offer an unbounded write.
+			definition.Writable = false
+		} else {
+			continue
+		}
+		definition = applyChoiceWritePolicy(definition)
+		value, err := readChoiceSettingFromSnapshot(definition, reads, func() ([]byte, error) {
+			return read(device, definition)
+		})
+		if err == nil {
+			value.Catalog = metadata
+			if profiled && exactSettingProfile(capabilities) {
+				value.Definition.ExpectedFirmware = capabilities.Firmware
+			}
+			reason := ""
+			if definition.Codec != nil && !choiceHasChange(value) {
+				value.Editable = false
+			}
+			if definition.DongleExactProfile && value.ChoiceIndex < 0 {
+				value.Editable = false
+			}
+			if catalogErr != nil {
+				reason = "Model data is unavailable; this control is read-only."
+			} else if !value.Editable {
+				reason = choiceSettingWriteReason(sourceDefinition, wanted, capabilities, property)
+			}
+			if reason == "" && definition.Key == "noise-cycle" {
+				reason = definition.Help
+			}
+			if definition.DongleExactProfile && value.ChoiceIndex < 0 {
+				reason = "The device reports a value Jabra's model data does not list for this firmware."
+			}
+			if profiled && !value.Editable {
+				value.Definition.Help = ""
+			}
+			value.Provenance = observedSetting(catalogErr == nil, capabilities != nil && capabilities.ExactFirmwareProfile && capabilities.DeviceFirmware != "", qualified, reason)
+			seen[definition.Key] = struct{}{}
+			values = append(values, value)
+		} else if definition.Codec != nil {
+			values = appendUnavailableChoice(values, seen, definition, "Unavailable")
+		}
+	}
+	return values
+}
+
+func choiceSettingForCatalog(definition choiceSettingDefinition, property modelcatalog.Property, exactProfile bool) (choiceSettingDefinition, bool) {
+	// Binding must not promote an unreviewed wrapper to a permitted codec type.
+	definition = applyChoiceWritePolicy(definition)
+	if definition.DongleExactProfile {
+		definition.Writable = definition.Writable && exactProfile
+	}
+	if definition.Codec != nil {
+		codec, choices, err := definition.Codec.BindProperty(property)
+		if err != nil || len(choices) == 0 {
+			return choiceSettingDefinition{}, false
+		}
+		definition.Codec, definition.Choices = codec, choices
+		definition.Writable = definition.Writable && exactProfile
+	} else {
+		choices := choicesAllowedByCatalog(definition.Choices, property.PossibleValues)
+		if len(choices) == 0 {
+			return choiceSettingDefinition{}, false
+		}
+		definition.Choices = choices
+	}
+	definition.Writable = definition.Writable && catalogAllowsSettingWrite(property)
+	return definition, true
+}
+
+func choicesAllowedByCatalog(choices []settingChoice, possibleValues []string) []settingChoice {
+	if len(possibleValues) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(possibleValues))
+	for _, value := range possibleValues {
+		allowed[strings.ToLower(strings.TrimSpace(value))] = struct{}{}
+	}
+	filtered := make([]settingChoice, 0, len(choices))
+	for _, choice := range choices {
+		catalogValue := choice.CatalogValue
+		if catalogValue == "" {
+			catalogValue = choice.Name
+		}
+		if _, exists := allowed[strings.ToLower(strings.TrimSpace(catalogValue))]; exists {
+			filtered = append(filtered, choice)
+		}
+	}
+	return filtered
+}
+
+func choiceSettingName(setting choiceSettingValue) string {
+	if setting.ChoiceIndex >= 0 && setting.ChoiceIndex < len(setting.Definition.Choices) {
+		return setting.Definition.Choices[setting.ChoiceIndex].Name
+	}
+	if setting.FallbackName != "" {
+		return setting.FallbackName
+	}
+	return fmt.Sprintf("Unknown (%d)", setting.Raw)
+}
+
+func nextChoiceIndex(setting choiceSettingValue) (int, error) {
+	if len(setting.Definition.Choices) == 0 {
+		return 0, fmt.Errorf("setting %s has no choices", setting.Definition.Key)
+	}
+	if setting.ChoiceIndex < 0 {
+		return 0, nil
+	}
+	return (setting.ChoiceIndex + 1) % len(setting.Definition.Choices), nil
+}
+
+func findChoiceIndex(definition choiceSettingDefinition, name string) (int, bool) {
+	if definition.Codec != nil {
+		id, err := definition.Codec.ParseChoice(name)
+		if err != nil {
+			return 0, false
+		}
+		for index, choice := range definition.Choices {
+			if choice.Raw == id {
+				return index, true
+			}
+		}
+		return 0, false
+	}
+	wanted := strings.ToLower(strings.TrimSpace(name))
+	wantedToken := choiceValueToken(name)
+	for index, choice := range definition.Choices {
+		if strings.ToLower(choice.Name) == wanted || choiceValueToken(choice.Name) == wantedToken ||
+			(choice.CatalogValue != "" && strings.EqualFold(choice.CatalogValue, wanted)) {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+// Speak 510 calls the two-choice property "Voice guidance". Tones is its
+// off position; this must never send raw value 2, which its profile excludes.
+func presentVoiceGuidance(device *jabra_DeviceInfo, definition choiceSettingDefinition) choiceSettingDefinition {
+	if device == nil || (device.productID != 0x0420 && device.productID != 0x0422) ||
+		definition.Key != "voice-prompts" || len(definition.Choices) != 2 {
+		return definition
+	}
+	tones, voice := false, false
+	for _, choice := range definition.Choices {
+		tones = tones || choice.CatalogValue == "tones" && choice.Raw == 0
+		voice = voice || choice.CatalogValue == "voice" && choice.Raw == 1
+	}
+	if !tones || !voice {
+		return definition
+	}
+	definition.Choices = append([]settingChoice(nil), definition.Choices...)
+	for index := range definition.Choices {
+		if definition.Choices[index].CatalogValue == "tones" {
+			definition.Choices[index].Name = "Off"
+		} else {
+			definition.Choices[index].Name = "On"
+		}
+	}
+	definition.Label = "Voice guidance"
+	definition.Help = "Off uses tones. Some voice prompts may remain."
+	return definition
+}
+
+func choiceValueToken(name string) string {
+	name = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(name)), "_", " ")
+	return strings.Join(strings.Fields(name), "-")
+}

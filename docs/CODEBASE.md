@@ -1,0 +1,650 @@
+# Codebase guide
+
+Jabridge has a terminal interface and a background service. Both use the same
+Go packages to work with devices. No Jabra SDK or vendor helper is required.
+
+[README](../README.md) covers the quick start. [Using Jabridge](USAGE.md)
+has detailed commands and device limits. [Build and test](DEVELOPMENT.md)
+includes package-managed builds.
+
+## Where to start
+
+| Folder | Responsibility |
+| --- | --- |
+| `cmd/jabridge` | Commands, terminal menu, setup and service management |
+| `daemon` | Device state, settings, buttons and background work |
+| `daemon/ipc` | Local requests between the app and service |
+| `daemon/pipewire` | Linux audio routing and volume |
+| `internal/firmware` | Firmware downloads, validation, transfer and recovery |
+| `internal/modelcatalog` | Jabra's published models, capabilities and releases |
+| `internal/selfupdate` | Signed updates to the Jabridge application |
+| `internal/history` | Private operation history used by debug reports |
+| `internal/buildinfo` | Application name and default version |
+| `internal/assets`, `internal/completion` | Setup files and Bash completion |
+
+## Follow a device firmware update
+
+```text
+Firmware menu                    firmware install FILE.zip
+      |                                    |
+tui_firmware_update.go             install_preflight.go
+      |                                    |
+interactive_install.go                     |
+      |                                    |
+      +------> firmware.go <---------------+
+                    |
+              choose updater
+       USB DFU / CSR / Sitel / UC Voice / PanaCast
+                    |
+           save recovery state
+           transfer and verify
+           check after restart
+```
+
+The menu remembers the selected USB attachment and firmware digest before
+showing confirmation. The installer checks them again. An unplugged device
+or changed file requires a new selection.
+
+Use [the firmware guide](FIRMWARE.md) for individual protocols and model checks.
+The menu and CLI use the same official-release check for shared CSR packages.
+A manifest may name a canonical USB ID while the selected UC/MS/Data variant
+has another ID. `validatedCSRProtocol` requires the exact published checksum,
+release version, one supported protocol and explicit catalog coverage of both
+IDs. Archive validation and the selected-device digest remain in place; the
+native updater and final verification use the actual selected USB ID.
+`PreparedInstall` re-captures the USB attachment before installation. Its private
+per-plan enumeration seam lets tests replace sysfs discovery while retaining
+the production fingerprint and comparison code.
+
+Wireless Engage adds a paired headset to that binding. The service supplies an
+identity digest, `interactive_wireless_install.go` captures its USB parent,
+and `sitel_ota_install.go` checks both devices after the service handoff. Its
+wireless channel shares Sitel framing and CRC checks but has its own mode and
+recovery sequence.
+
+### Engage 75 component diagnostics
+
+`internal/firmware/sitel_dect_inspect.go` shares strict identity decoders with
+`sitel_dect_runtime.go`. An explicit component check uses only allowlisted
+class-2 IDENT reads on a freshly bound attachment: base 1 (compatibility probe
+8), headset 10, display 3 and radio 2. The base probe and component identity
+are separate logical PID reads; failed steps are never resent. Each query has
+3 seconds and the whole inspection has 25 seconds. A timed-out component's
+remaining steps are skipped while independent components are still checked.
+A failed base-component PID read also skips all later base steps. A missing
+radio version is distinguished from passing identity reads: a fresh install
+would stop unless it has an unfinished, bound recovery record.
+Serial values remain private. A changed binding discards the entire result.
+Presence labels reuse the collected headset-version reply. A rejected PID or
+boot ID alone never gives docking advice; only a run with no successful headset
+reply suggests checking the dock. Reports distinguish an answering component
+with missing identity values and list the later measured blockers. This is
+presentation only: the installer still refuses those replies.
+
+`diagnostics.dect_components` is an optional read-only IPC method, forwarded by
+`daemon.busylightAPI`. `cmd/jabridge/dect_components.go` owns the service bridge
+and debug formatting. It drains existing management handles with the physical
+port gate, waits up to 5 seconds for ownership, and rejects stale registry
+instances or USB serials. `controlPortScopedPID` adds ownership for the existing
+Engage 75 runtime IDs; `scopedControlPID` retains its Link 390-only reset,
+settings and generation meaning. Known other ports remain independent;
+unresolved management parents are refused while an exclusive owner is active.
+
+The debug client checks service version and capabilities before making the
+new request, with a separate 35-second timeout. Older services produce a
+NOT TESTED instruction, never a substitute request. Existing background and
+`diagnostics.device` query sequences are unchanged. Address-role labels make
+clear when the existing metadata came from the display controller. Moving
+primary discovery from the display to the base remains deferred: issue #62's
+physical reports show that the catalog variant belongs to the headset, not the
+base. A metadata change must not silently unlock setting writes.
+
+The component report is evidence from one attempt. It neither authorizes
+installation nor changes any PID, boot-ID, serial, variant, region, downgrade,
+recovery or firmware-write guard. See [the candidate test](TEST_ENGAGE75.md).
+
+`debug --dect-image-info` additionally requests the optional
+`diagnostics.dect_image_info` method for the reported direct USB `1113` variant.
+`sitel_dect_info.go` permits only empty-payload class 15/opcode 0 reads at
+addresses 1, 10 and 3 through the bound normal management adapter. It never
+opens the HP link, enters a bootloader, selects targets or creates recovery
+state. Each address gets one attempt, with 3-second queries and a 25-second
+total limit. The client shares the existing native-debug deadline. Ordinary
+debug and class-2 query sequences are unchanged.
+The opt-in check opens its own IPC connection and sends that absolute deadline
+in the request envelope. `handleScopedImageInfo` cancels the request on EOF,
+deadline expiry or an unexpected pipelined request; the context is forwarded
+through the daemon wrapper, port acquisition and core read. `CallScoped` closes
+only this dedicated connection on cancellation. Other RPCs and the main debug
+connection retain their existing behavior.
+
+Replies use the existing strict 17/19-byte `decodeSitelInfo` parser, without
+changing installer parsing. Image IDs, modes and geometry are observations;
+expected image IDs are labelled separately. They are not runtime PIDs, and
+neither matches nor failures change the installer's original verdict. Support
+for this read is now measured on the reporter's firmware: the headset returns
+image `1116`, while the base and display reject it. This does not supply the
+display's image ID or qualify an update. Changed bindings
+discard all image observations; errors and reports omit serials and raw bytes.
+
+`sitel_dect_image_barrier.go` separates Engage 75 FWU image identification from
+preparation. On an already-open, bound FWU connection, it reads only op0 for the
+base, headset and display and checks every actual image ID against the archive
+profile. Only after the complete sweep succeeds may preparation switch a child
+or select an area. The same peers/sequences are retained, but preparation reads
+and validates each component again before using its current ID, mode or geometry.
+Information after a mode switch is also read again. Other DECT profiles
+retain their prior preparation sequence. This does not enter update mode,
+relax missing runtime identity checks or authorize an old-firmware upgrade.
+
+`sitel_dect_assessment.go` adds a private typed assessment to native installer
+planning. The existing strict collector remains unchanged. Only the measured
+USB `1113` / variants `001b`, `0148`, `0304` / firmware `4.4.1` rejection pattern
+can collect the later independent observations. The headset's GetInfo image ID
+remains separate from rejected runtime PID and IDENT boot-ID fields. Query
+address/class/opcode, outcome and value are recorded separately; private serials
+are never included in the error text. Fresh attachment checks surround reads,
+and a changed binding discards the assessment.
+
+The ordinary installer still returns `NeedsBootloaderIdentity` before entry.
+It does not manufacture missing runtime IDs. The default strict collector,
+legacy recovery hashes and background diagnostics keep their prior behavior.
+
+`engage75_preview*.go` implements a separate, default-disabled compatibility
+executor for the measured 1113/4.4.1 tuple. An enabled trial build, the separate
+preview option and the explicit firmware-risk flag are all required. File-only
+preflight rejects disabled previews before interrupting the running service.
+The private pending-inspection journal is persisted before one base entry;
+it is never install authority. On the bound new attachment, op0 measures base,
+headset and display image IDs before any child transition or target selection.
+Only then is the fixed selected-field V2 recovery record saved. Missing runtime
+IDENT values remain unavailable; image IDs do not become runtime PIDs.
+
+The preview supports reported loader0/Main1 explicitly and refuses modes2/3.
+Fresh loader geometry, image and mode checks guard preparation, HEX effects
+and radio operations. Radio progress fields are shared with the existing
+transfer without manufacturing a legacy DECT identity. All nine components,
+CRC/settings checks and strict final versions remain required. Return is
+headset before base. A fresh headset image/Main observation is required before
+the base return, and is repeated in final runtime; neither an ACK nor base
+reappearance alone is success. Changed Main geometry is allowed. New runtime PID mappings
+that were not established in the original observations remain unresolved.
+
+Both journal and V2 records refuse automatic cross-process replay: stored
+headset serials cannot prove fresh dock continuity. Within a single execution,
+the headset must stay docked; an unobservable same-model swap is not detected.
+Update-mode transitions accept a missing USB serial, as the native installer
+does, but require the same resolved topology and bus and a new bound instance.
+Any available mismatching serial is refused; normal-mode return requires the
+original nonempty serial. A same-model swap during the expected restart gap
+may therefore be detected only by the final runtime identity check. Failures retain evidence;
+there is no guessed MMI reset or claimed intact-application abort recovery.
+The preview is not enabled in official builds. `engage75_attempt.go` versions
+the pending journal separately: V2 retains the furthest phase, boot serial
+availability and attempt count while reading existing V1 evidence unchanged.
+`--new-attempt` permits only a new qualification from normal mode, never a
+resume: exact archive, no recovery authority, early phase, both returns unsent,
+and two complete fresh original selections. The prior record is archived;
+a staged transaction blocks all installs if its two renames are interrupted.
+A fourth attempt is refused. No state file is deleted to bypass checks.
+
+### Firmware files by job
+
+| Job | Files in `internal/firmware` |
+| --- | --- |
+| Keep one immutable copy of the selected archive | `firmware_snapshot.go` |
+| Match a model to its update route | `*_profiles.go`, `install_preflight.go` |
+| Parse and check archive contents | `*_image.go`, `*_archive.go`, `sitel_images.go` |
+| Drive an update and resume after interruption | `*_install.go`, `recovery.go` |
+| Exchange device packets | `sitel_link.go`, `sitel_spi.go`, `*_transfer.go`, `*_protocol.go` |
+| Open the selected Linux USB, HID or video interface | `*_linux.go`, `*_hidraw.go` |
+| Stage PanaCast 50 files through UDisks | `camera_mass_storage.go` |
+
+For Engage 75 and 75 SE, `engage75_archive.go` checks all nine components.
+`sitel_dect_install.go` owns the base and headset lifecycle, while
+`engage75_transfer.go` keeps the radio, settings and HEX transfers in order.
+`sitel_bluecore_image.go` reads the radio images and ordered settings.
+`sitel_spi.go` carries chip word reads and writes through the DECT base.
+`sitel_internal_program.go` builds our standalone RAM flash program;
+`sitel_internal_flash.go` uploads it, transfers sectors and checks readback.
+`sitel_bccmd.go` discovers the running chip's settings mailbox, and
+`sitel_psr.go` applies the selected chip's settings in file order.
+
+The `*_sim_test.go` files model device responses and faults. They exercise
+production host code, but do not execute the radio application or replace
+physical hardware qualification. JabraCLI is an offline research reference;
+Jabridge neither runs it nor requires its package.
+
+Application updates are separate: `cmd/jabridge/app_update.go` calls
+`internal/selfupdate`. They do not install headset firmware.
+
+`main.go` calls `app_update_prompt.go` before starting an interactive menu or
+command. The check has a short timeout, and the prompt reads only its own
+answer line. An accepted offer and `jabridge update` both call
+`installAppUpdate` in `commands.go`, then `completeAppUpdate` in
+`app_update.go` refreshes completion and the installed service copy. Startup
+offers restart the updated executable with the original arguments.
+
+`internal/buildinfo.SelfUpdate` is a build-time policy for package maintainers.
+It defaults to `enabled` and can be set with Go's linker `-X` option. Only that
+exact value permits app updates. `offerStartupAppUpdate` returns before creating
+an update client when disabled; `runUpdate` returns a package-manager error
+after help and argument parsing. `installAppUpdate` repeats the check before
+output, service inspection, downloads or executable replacement. There is no
+runtime override. This policy does not control device firmware or setup.
+
+`internal/buildinfo.Setup` is a build-time policy for package maintainers. It
+defaults to `enabled` and can be set with Go's linker `-X` option. Only that
+exact value permits setup. `runSetup` returns a package-manager error after
+help, before any helper or privileged step. `offerDeviceAccessSetupFor` reports
+missing device access instead of offering setup. `installUserFiles` repeats the
+check before it copies the executable, installs Bash completion or writes the
+user service, so its other callers cannot bypass it. `prepareUserService` and
+`installedUserExecutable` return the running executable for `service start` and
+`restart` and for the no-systemd fallback. The terminal menu returns
+`errPackagedServiceNotRunning` instead of installing and enabling a unit, and
+`completeAppUpdate` has no copy to refresh. Starting the service is left to the
+package's own unit. There is no runtime override, and device firmware is not
+affected.
+
+When setup is disabled, a matching service is used without the legacy
+read-only-history check that normally refreshes a self-installed user unit.
+The package owns that unit, and a history problem must not block the menu.
+Setup and service help also explain package management when setup is disabled.
+
+`tui_app_update.go` owns the update decision screen and its single-key input.
+It stops its input reader and restores the terminal before handing control to
+the installer or main menu. `tui_theme.go` holds the shared home/update palette.
+
+The main UI handles input and service results separately from its 30 FPS paint
+deadline in `tui_frame_clock.go`. It checks that deadline after every event so
+busy input cannot starve drawing. Late timers do not cause catch-up bursts, and
+animation uses elapsed time. An idle screen writes no repeated frames.
+The input reader polls the terminal
+without changing its shared file flags, so reading keys cannot make output
+nonblocking and truncate the footer. Terminal write errors are returned.
+
+`tui_search.go` polls search status in a worker. The UI loop applies results
+only for the current search; leaving or restarting it cancels old work.
+Start and Stop commands keep their order even when Back arrives during startup.
+Cached native completion, timeout and failure states remain visible in the menu.
+Terminal tests cover slow service replies, stale results, resizing, key hints
+and output backpressure through a real pseudo-terminal.
+
+## Dongle pairing
+
+### Reads and discovery
+
+`supportsValidatedPairingReads` in `pairing_policy.go` checks the dongle's USB ID.
+`bluetooth_search.go` uses that policy for discovery. Headset models are not
+hardcoded into this gate. See the [Link 390 test report](HARDWARE_TESTING.md#link-390-pairing-and-dongle-write-test)
+for the tested dongle and headset.
+
+### Pairing writes
+
+`supportsExperimentalDongleWrites` keeps remembered-device writes separate
+from discovery and fresh pairing. `paired_devices.go` uses it for connect,
+disconnect and forget. Search-connect checks `pairingPolicy.SearchConnect`
+before stopping discovery or opening the management interface. The 24c9 policy
+grants fresh search-connect by default without granting remembered-device
+or settings writes. The [hardware report](HARDWARE_TESTING.md#link-390-pairing-and-dongle-write-test)
+lists the operations checked on Link 390.
+
+For the candidate `2e57` search flow, `internal/btsearch` has a separate
+dual-mode decoder and typed pairing transaction. Raw discovery flags are
+translated into classic/LE namespaces; duplicate addresses with different types
+remain separate choices. The service labels those choices for the client.
+The legacy Link 380 decoder and command bytes are unchanged.
+
+`bluetooth_search_bound.go` captures `firmware.ControlBinding` at search start.
+That small wrapper reuses the firmware module's USB generation and opened-FD
+parent/VID/PID checks. The binding follows neither a PID match nor a replacement
+USB attachment. Available USB serials are checked in their own format.
+An independent passive reader is opened before Stop/Pair. Attach/name events
+accelerate a fresh connected-entry check; missing events fall back to reads no
+faster than once a second. Each complete confirmation has a one-second deadline
+inside the unchanged 30-second pairing budget. Writes are never replayed.
+
+`internal/history/history.go` includes fresh search-connect requests in the
+bounded local history. Frequent search-status polling stays excluded. History
+keeps the method, phase and classified error, not request parameters, addresses
+or search tokens.
+
+### Link 380c pairing
+
+`pairing_policy.go` separates pairing-list/search access, fresh search-connect,
+remembered-device writes and bound transport from the search wire format.
+Link 380c 24c9 list, Classic discovery and fresh pairing are enabled by default
+after the successful pairing report in #58. The old service-start option is no
+longer read. `devices.list.searchConnect` advertises the effective permission
+to the terminal client. `dongleSearchConnectAllowed` uses that field when a
+backend is present and the policy table in direct mode. For 24c9, the UI never
+falls back to the static table when an older service omits the permission.
+Client environment variables never authorize service writes. Search start rechecks
+permission centrally in `queueSearchCommand`; stopping search is never gated. The service checks the policy before stopping
+search or opening the pairing path. Remembered-device, settings and reset
+gates stay separate and unchanged.
+
+This path uses the existing captured USB control binding with the legacy
+Classic start/stop masks. `PairLegacyBound` translates discovery flag 1 into
+Classic pairing namespace 0, sends one pair request after the session stops,
+and reuses the bounded confirmation loop. Binding a device never changes its
+wire masks. Acknowledgement alone is not success, writes are never replayed,
+and confirmation stays on the captured dongle and selected address. The tested
+24c7/24c8 path and Link 390 dual-mode flow retain their wire behavior.
+
+### Experimental Link 390 firmware
+
+`csr_link390.go` recognizes the narrow monolithic package and owns the
+protocol-7 transaction. Its stage uses the shared transfer primitive with an
+explicit protocol-7 policy: 8-byte count/CRC header, 52-byte blocks, final-batch
+acknowledgement, and version plus language. The existing extended 16/17 and
+legacy partitioned gnV flows keep their wire behavior.
+
+`csr_link390_linux.go` reads identity and protocol from the bound dongle.
+Language may be unavailable for this policy, matching the vendor's fallback;
+the candidate accepts only an unambiguous single-English image. Commit uses no
+configuration-end command. Fresh runtime identity and requested firmware must
+be read back, on either the same or a correctly rebound USB generation.
+
+`csr_link390_install.go` integrates the existing sealed archive, official release
+authorization, daemon pause, firmware lease and confirmation. It requires its
+own process-start opt-in. Recovery is saved durably before transfer and before
+commit. A `csr7-committing` record only permits read-only verification after
+interruption. It never authorizes another erase or commit.
+
+Archive inspection and installation share the profile validator. A successful
+layout check does not claim that the device was tested or that installation is
+enabled. See the candidate qualification limits in `HARDWARE_TESTING.md`.
+`TEST_LINK390.md` contains the isolated review-service and firmware test steps.
+
+### Setting validation
+
+`setting_metadata.go` carries model help, groups and restart information from
+successful reads to IPC, the menu and CLI. Local help and read-only reasons
+take priority. Controller parts never inherit the headset's model text.
+`modelcatalog.DisplayText` removes terminal controls and limits descriptions;
+duplicate metadata merges deterministically, keeping any restart warning.
+The optional IPC `requiresRestart` field records catalog advice separately
+from the existing `mayRestart` configuration-mode warning. Unknown restart
+information is omitted; a fallback profile cannot promise no restart.
+These descriptions never grant writes or change configuration-mode packets.
+
+`equalizer.go` validates the five bands against the exact model's static
+frequencies, Q and gain limits. Each row exposes half-dB choices, while encoding
+preserves the master gain and every other band's freshly read raw fields.
+`choice_payload.go` owns the shared codec contract and a cache scoped to one
+settings snapshot, so five EQ rows need one device query. It never caches writes.
+Unknown layouts show one generic read-only Equalizer row instead of guessing
+band frequencies. Other structured controls retain their own unavailable row.
+
+The equalizer editor in `tui_settings_editor.go` shows the actual current level,
+starts near it even when it is between steps, and uses arrows for 1 dB or
+Shift+arrows for 0.5 dB. It reserves separate rows for current value, step hints,
+the scroll window and Save/Cancel, including at 40×20.
+An invalid current value defaults to 0 dB, and Enter without moving an off-step
+selection makes no change.
+
+`settings_transaction.go` holds shared device access before taking the separate
+settings-write lease. Only read-modify-write operations take this nonblocking
+cross-process lock; scalar writes and normal reads keep their existing path.
+The lease lasts through full readback and prevents overlapping Jabridge changes
+from overwriting another band or preserved field. Firmware keeps its own lock.
+New power-saving and structured writes also verify the bound firmware version
+on their held transport, because a headset behind a dongle can update without
+changing the dongle's USB attachment. No new check is added to old scalar writes.
+
+`noise_cycle.go` validates the model's button-cycle members and encodes its
+length-prefixed list. Separate boolean members do not establish valid mode
+combinations. The default offers the full catalogued cycle and the current
+read value; selecting the current value is a no-op before device access or
+transaction locking. `setting_qualifications.go` narrows choices to reported
+working combinations for an exact headset, firmware and dongle route. It does
+not alias other models or firmware. Qualified choices bind the parent dongle's
+attachment, PID, firmware and HID path. They are checked before the settings
+lease, on the held transport just before the command, and after readback.
+Dongle firmware comes from registry metadata; no extra dongle query is added.
+An unobserved firmware change is not detected until that metadata or the USB
+attachment changes. The codec also rejects unconfirmed new combinations before
+a write and preserves the freshly read order.
+
+`setting_capability.go` records model, exact-firmware, current-read and hardware
+report evidence separately. Bool, choice and text resolvers reuse their existing
+reads; they do not scan unknown commands or probe writes. IPC's optional
+`support` object carries the same evidence into the menu and clients. A current
+read proves that a control answered, not that every write works. Offline model
+data leaves existing safe read probes read-only. Existing dongle write gates,
+firmware guards, target identity and full readback remain required. There is no
+known universal device command that lists every setting and allowed value.
+
+The optional choice payload codec binds to an exact firmware profile before
+editing, encodes from a fresh read, and verifies the full readback. Ordinary
+single-byte choices retain their existing encoder and readback rules.
+
+`voice_language.go` reads the complete 16-bit voice-language ID as a read-only
+setting and links to the Firmware menu. It never sends a direct language write.
+`tui_firmware_language.go` loads the current language and verified package
+choices asynchronously, binds the file and USB attachment, and hands the
+chosen language to the existing typed-confirmation installer. Cancel, an
+unchanged selection and a stale target never prepare a hardware write.
+
+`csr_language_plan.go` selects tunes content independently from main firmware;
+both can use partition zero with different versions. `csr_language_update.go`
+owns the new protocol-17 language-only policy: per-file version and LCID,
+every batch acknowledgement, commit, serial/permission/configuration exit,
+then fresh main-version, tunes-version, language and USB-generation checks.
+The old protocol-16/17 transfer policy remains unchanged. The new language path
+is limited to direct USB Evolve3 65 PID 2549/variant 01-A3 and an exact model
+profile with matching main firmware. It has a separate default-off preview opt-in.
+
+Recovery saves the source attachment and target language/pack before transfer
+and before commit. Once a commit may have started, retry only reads and verifies;
+it never erases, transfers or commits again. Normal firmware installation refuses
+a pending language update. The sealed archive, official release checksum,
+exclusive device lease and target binding remain required.
+
+The power-saving boolean uses the vendor's off sentinel: every byte except
+255 means on, while writes use 1 or 255. It requires an exact firmware profile
+with both boolean choices before editing, and reuses the bound headset-part
+transport and readback checks. Existing strict booleans keep their old decoder.
+
+`modelcatalog.Property` retains composite member paths, fixed values and
+editable members, plus special handling such as a required voice-language
+pack. Existing flat values stay unchanged. Missing static/editable metadata
+remains unknown so a structured control can refuse incomplete profiles.
+
+`choice_settings.go` shares choice names between the menu, command line and
+IPC. Auto-sleep labels match Jabra Plus's 15-minute to 8-hour choices; catalog
+values still filter the supported raw bytes for each model. Bash completion
+mirrors these names, with regression tests for both settings and IPC commands.
+
+`settings.go` requires both write support and `validatedForDongle` for each
+dongle setting. Only auto-pairing is writable on the tested Link 390; its
+other settings remain read-only as described in the [test report](HARDWARE_TESTING.md#link-390-pairing-and-dongle-write-test).
+
+### Implemented setting writes
+
+`control_gate.go` and `control_gate_hidraw.go` coordinate Link 390 traffic per
+physical USB port. Existing readers drain before ownership, and bound search
+keeps its permit until close. Unknown-parent exchanges also participate, so
+they cannot race the transition from idle to owned. Read-only passive HID
+observers send no GNP and do not block ownership. See [the reader audit](READERS_AUDIT.md)
+for the lock order, covered entry points and process-local boundary.
+
+`link390_config.go` owns a single-write configuration transaction. Its byte
+values cover the exact wireless-range and softphone contracts in
+`link390_config_definition.go`. The native source verifies USB and GNP identity,
+variant and firmware on every handle, and holds the settings lease before the
+port permit. END is attempted only on the original attachment. Reopened handles
+are read-only. The software verification policy waits at least three seconds
+after END and requires two matching reads at least one second apart on one
+generation; it is not a measurement of hardware settling or persistence.
+Failure recovery refreshes only a verified physical attachment, otherwise the
+stale registry slot is invalidated. This engine alone exposes no setting writes.
+
+Link 390 `2e56` and `2e57`, variant `04-10`, firmware `3.2.0` also expose
+preferred connection mode (`13/FB`) and computer audio (`0D/0F`). Their scalar
+definitions require one-byte replies, a serial and attachment identity, and an
+exact matching live model. Only the catalog intersection is offered. Other
+dongles return before the extra catalog lookup; diagnostics apply the same
+identity and model exclusion before issuing these reads.
+These controls use the profiled held-handle firmware check, then one write
+and verified readback. They do not grant pairing, reset or other dongle writes.
+They have software coverage but no physical report.
+
+`setting_write_policy.go` permits the implemented noise-cycle and equalizer
+codecs by default. Power saving also needs no environment option. Unknown
+structured codec types are refused before no-op handling, leases or transport;
+client flags cannot grant permission. `exactSettingProfile` requires the actual
+device firmware to be known as well as an exact catalog match. Model access,
+allowed values, target identity, route binding and full readback remain required.
+
+The bool and choice snapshot collectors accept a read function so tests can
+exercise production filtering and provenance with simulated replies. Normal
+callers use the existing device readers. Read-only rows explain the missing
+model or implementation without adjustment advice. A noise cycle with no
+different permitted choice does not offer an edit. Legacy scalar controls,
+dongle qualification and separate firmware options keep their existing gates.
+
+`pairingUIAllowed` uses the daemon's advertised 24c9 permission for client
+visibility; it never authorizes backend IO. Both low-level pairing reads and
+cached IPC lists use backend policy. Global pairing-mode commands also require
+the existing remembered-write allowlist. Link 390 2e56 list/search have no
+opt-in in this stable release; firmware testing is a separate permission.
+
+### Factory reset
+
+Link 390 PID 2e56 list and search are disabled in 1.5.0.
+Its pairing, remembered-device and auto-pairing writes remain blocked until a
+volunteer confirms the reads. The preview UI hides those actions. Other
+Link 390 IDs and the Link 380 flow keep their existing gates.
+
+`supportsValidatedFactoryReset` remains the legacy Link 380-only gate for
+`device.reset`. Link 390 uses the separate `device.reset.bound` route only for
+`2e57`, variant `04-10`, firmware `1.3.0`. `link390_reset.go` separates reset
+request/rejection/unknown/restart verification; `link390_reset_hidraw.go` owns
+leases, one-command transport, the attempt ledger and registry recovery.
+`link390_reset_summary.go` reports optional checks without claiming erased
+pairings. `tui_bound_reset.go` pins the two-press confirmation and shows the
+outcome. The [hardware report](HARDWARE_TESTING.md#link-390-pairing-and-dongle-write-test)
+and new software flow are separate evidence.
+
+## Build and check
+
+```sh
+make check
+make build
+dist/bin/jabridge --version
+```
+
+`make check` runs formatting, vet, race tests, static tests, completion checks
+and golangci-lint. Use the Go version in `.go-version` and the linter version
+in `.github/workflows/ci.yml`.
+
+The default version lives in `internal/buildinfo/buildinfo.go`. The Makefile
+and release workflow read it. `make build VERSION=...` overrides it for a
+preview without changing the source default.
+
+Tests with a `JABRIDGE_TEST_*` archive variable are optional local checks.
+Their firmware files stay outside this repository and release archives.
+
+## Find related code
+
+If you have repomap installed, ask it for the parts related to your task:
+
+```sh
+repomap . --query 'firmware install recovery' \
+  --mentioned-symbol PrepareInteractiveInstall
+```
+
+Then read the named functions and their callers. A map is a starting point;
+tests and the actual code establish how the path behaves.
+
+## Headset volume
+
+`jabridge headset volume` follows `cmd/jabridge/headset_volume.go` through the
+`device.volume` IPC method into `internal/headsetvolume`. It controls the
+selected headset's USB audio gain. `jabridge sound volume` continues to use
+PipeWire through `daemon/pipewire`.
+
+The headset path checks the model, firmware, USB attachment and Audio 1
+playback descriptors. It uses the Evolve2 30 SE firmware's endpoint request
+route so Linux keeps its audio driver attached. It does not reset the device.
+An internal probe checks the saved USB value before each write. Writes report USB request acceptance;
+the firmware applies and saves changes asynchronously. History records these
+requests separately from PipeWire changes.
+
+`internal/headsetvolume/profiles.go` selects supported operations by model,
+firmware and connection. The client asks the service for support through
+`device.volume.info`, so the CLI does not maintain its own model allowlist.
+`device.volume.get` is an explicit saved-level read. Discovery and debug never
+run it automatically. A new transport needs its own verified protocol profile;
+the existing USB request must not be redirected to a dongle audio interface.
+
+## Silent USB playback recovery
+
+`jabridge sound recover` calls `sound.recover` in the service.
+`daemon/pipewire/audio_recovery.go` binds the output and microphone to the same
+Evolve2 30 SE audio card, waits for its temporary capture to be active, sends
+Suspend then Start to playback, and closes capture. Every stage checks the graph
+identity and profile again. Existing calls/capture and other models are refused.
+
+Recovery keeps capture active for at least two seconds before Suspend, waits
+half a second before Start, and keeps capture for two seconds afterward. These
+minimum delays come from the tester's successful script; graph state alone does
+not establish that the USB device has settled. They remain cancellable.
+
+`audio_recovery_process.go` runs `pw-cat` with a specific object serial and no
+fallback, movement or reconnect to another microphone. Captured data is discarded.
+The process has a time limit and a parent-death signal. Failure cleanup attempts
+to restart only the original playback node before closing capture. Like the
+existing `wpctl` controls, `pw-cli` resolves a numeric ID separately from the
+snapshot check; this is not an atomic native PipeWire transaction.
+The command includes the required empty command object (`{}`). `pw-cli` can
+return exit status zero while printing an error, so stderr is also checked and
+bounded. A successful return still does not prove audible recovery.
+
+`cmd/jabridge/debug_usb_audio.go` reports numeric hub/controller IDs and matches
+sticky-mixer warnings to the current USB port. These warnings may belong to an
+earlier attachment on the same port. Raw kernel logs and USB serials are omitted.
+The kernel mixer issue and hub-dependent silent playback remain distinct clues,
+not diagnoses inferred from a kernel version or controller name alone.
+
+Link 390 native transaction tests (`link390_config_native_test.go`) replace only OS discovery/open boundaries. The real identity queries, leases, ownership, wire commands, reconnect verification and registry publication run against socket-backed fake dongles. Transport timeouts remain retryable; identity mismatches stop verification. Unacknowledged writes stay unknown even when later reads show a different value.
+
+`link390_config_apply.go` binds exact Link 390 softphone definitions and routes
+CLI, IPC and compatibility setters through one configuration flow. The verified
+readback and attachment are returned without PID-based refresh. `ResponsePrefix`
+in choice definitions checks ringer selectors before decoding the value.
+
+An exact Link 390 settings listing shares one model lookup across Boolean and choice rows, including lookup failure. An offline catalog does not cause a second lookup timeout for the same listing.
+
+### TUI request connections
+
+After startup, the TUI keeps one connection for status refresh, events and
+reconnects. `tuiIPCCall` opens one short-lived connection per action and sends
+one request; it never retries a request. A one-slot action gate preserves the
+ordering of settings loads and changes. Search start, stop and status use
+separate ungated calls because the search command queue already orders them.
+`close` rejects new calls and closes active action clients; a late reconnect
+cannot revive a closed backend. Pairing actions allow 45 seconds for command
+acknowledgements and state checks. Other CLI clients retain their own existing
+connection handling.
+
+For scoped dongles, registration captures the kernel USB generation before enrichment and outside the registry lock. Each registry instance retains that generation; only a verified transaction rotation publishes a new instance and generation together. Reset refuses a stale generation before opening HID. Missing-generation slots are retired after the metadata retry interval and registered again, never refreshed into permission in place.
+
+Exact-profile Link 390 setting writes compare their cached attachment before opening HID and again on the held handle after the firmware query. Shared ownership prevents these checks from retiring a slot during another configuration transaction. Other device families retain their existing paths.
+
+### Engage 75 hardware-test bundle
+
+The manual `engage75_test` input in `ci.yml` defaults off. After native CI
+passes, its separate job builds pinned engine commit `51ccda9`, verifies the
+reviewed binary hash and packages `scripts/engage75-test.sh`. Normal PR and
+release builds keep the compatibility preview disabled. The helper verifies
+files, requires typed acceptance, downloads the exact official firmware,
+records one result and refuses a second run. Exclusive folder ownership is
+reserved before shared-file changes, so concurrent windows cannot overwrite
+the first result.
+`scripts/test-engage75-wrapper.py` exercises this wrapper with fake commands
+and the checked archive as data; it does not access hardware. It does not install the app or
+change device-access rules. See `TEST_ENGAGE75.md` for the human test steps.
